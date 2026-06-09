@@ -1,46 +1,94 @@
-// content-scripts/claude.js
-// Runs on claude.ai — detects rate limit, extracts conversation, notifies background.
+// content-scripts/chatgpt.js
+// Runs on chatgpt.com — scrapes chats, injects incoming context, detects limits, and shows toast.
 
 (function () {
   "use strict";
 
-  if (window.__claudeReadyInitialized) {
+  if (window.__chatgptInitialized) {
     return;
   }
-  window.__claudeReadyInitialized = true;
+  window.__chatgptInitialized = true;
 
   // ─── Selectors ────────────────────────────────────────────────────────────
-  // These target Claude's DOM structure. May need updating if Claude changes its UI.
   const SELECTORS = {
-    // Each conversation turn container
-    messageContainer: '[data-testid="conversation-turn"], .conversation-turn',
-    // Human message text
-    humanMessage: '[data-testid="user-message"], [data-testid="human-message"], .font-user-message',
-    // Claude's response text
-    assistantMessage: '[data-testid="assistant-message"], [data-testid="ai-message"], .font-claude-message, .font-claude-response',
-    // The send button (disabled when limited)
-    sendButton: 'button[aria-label="Send message"]',
-    // Rate limit / usage limit banner text patterns
+    // Turn container
+    messageContainer: '[data-testid^="conversation-turn-"], article, .group',
+    // User message
+    humanMessage: '[data-testid="user-message"], [data-message-author-role="user"]',
+    // ChatGPT response
+    assistantMessage: '[data-message-author-role="assistant"], .markdown',
+    // Input textbox
+    input: '#prompt-textarea',
+    // Send button
+    sendButton: '[data-testid="send-button"], button[aria-label="Send prompt"], button[aria-label="Send message"]',
+    // Limit indicators
     limitBannerTexts: [
-      "you've reached your usage limit",
-      "message limit reached",
+      "you've reached your hourly limit",
+      "you've hit the limit",
+      "too many requests",
+      "please try again in",
+      "upgrade to plus",
+      "our systems are busy",
       "usage limit",
-      "you've hit the",
-      "start a new conversation",
-      "your limit",
-    ],
+      "limit reached"
+    ]
   };
 
   // ─── State ────────────────────────────────────────────────────────────────
   let limitDetected = false;
   let observer = null;
 
-  // ─── Limit Detection ──────────────────────────────────────────────────────
+  // ─── Context Injection (Receiver Mode) ─────────────────────────────────────
+  chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+    if (msg.type === "INJECT_CONTEXT") {
+      injectPrompt(msg.payload.prompt, msg.payload.autoSubmit);
+      sendResponse({ success: true });
+    }
+    if (msg.type === "EXTRACT_CONVERSATION") {
+      const messages = extractConversation();
+      sendResponse({ success: true, messages });
+    }
+    return true; // keep channel open
+  });
 
-  /**
-   * Checks the entire visible DOM for any rate limit indicators.
-   * Returns true if a limit signal is found.
-   */
+  function injectPrompt(promptText, autoSubmit) {
+    const input = document.querySelector(SELECTORS.input);
+    if (!input) {
+      console.error("[LLM Failover] ChatGPT input not found. Retrying...");
+      setTimeout(() => injectPrompt(promptText, autoSubmit), 1500);
+      return;
+    }
+
+    input.focus();
+    input.innerHTML = "";
+    document.execCommand("insertText", false, promptText);
+
+    if (!input.innerText.trim()) {
+      input.innerText = promptText;
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    }
+
+    console.log("[LLM Failover] Prompt injected into ChatGPT.");
+
+    if (autoSubmit !== false) {
+      setTimeout(() => {
+        submitPrompt();
+      }, 600);
+    }
+  }
+
+  function submitPrompt() {
+    const sendBtn = document.querySelector(SELECTORS.sendButton);
+    if (sendBtn && !sendBtn.disabled) {
+      sendBtn.click();
+      console.log("[LLM Failover] Prompt submitted to ChatGPT.");
+    } else {
+      console.warn("[LLM Failover] ChatGPT send button not found or disabled.");
+    }
+  }
+
+  // ─── Limit Detection & Conversation Scraping ────────────────────────────────
+
   function isLimitReached() {
     const bodyText = document.body.innerText.toLowerCase();
     return SELECTORS.limitBannerTexts.some((phrase) =>
@@ -48,24 +96,8 @@
     );
   }
 
-  /**
-   * Also watches for the send button becoming disabled as a secondary signal.
-   */
-  function isSendButtonDisabled() {
-    const btn = document.querySelector(SELECTORS.sendButton);
-    return btn && btn.disabled;
-  }
-
-  // ─── Conversation Extractor ───────────────────────────────────────────────
-
-  /**
-   * Walks the DOM and pulls all conversation turns into a normalized array.
-   * Returns: Array<{ role: "user" | "assistant", content: string }>
-   */
   function extractConversation() {
     const messages = [];
-
-    // Strategy 1: use data-testid turn containers (most reliable)
     const turns = document.querySelectorAll(SELECTORS.messageContainer);
 
     if (turns.length > 0) {
@@ -81,12 +113,10 @@
         }
       });
     } else {
-      // Strategy 2: fallback — look for alternating message bubbles
-      // Claude renders messages in divs with specific classes
+      // Fallback
       const allHuman = document.querySelectorAll(SELECTORS.humanMessage);
       const allAssistant = document.querySelectorAll(SELECTORS.assistantMessage);
 
-      // Interleave by DOM order
       const allMessages = [
         ...Array.from(allHuman).map((el) => ({
           role: "user",
@@ -100,7 +130,6 @@
         })),
       ];
 
-      // Sort by DOM position
       allMessages.sort((a, b) => {
         const pos = a.node.compareDocumentPosition(b.node);
         return pos & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1;
@@ -114,10 +143,33 @@
     return messages.filter((m) => m.content && m.content.trim().length > 0);
   }
 
-  // ─── Notify Background & Show Toast ───────────────────────────────────────
+  function notifyLimitReached() {
+    if (limitDetected) return;
+    limitDetected = true;
+
+    const messages = extractConversation();
+    if (messages.length === 0) {
+      console.warn("[LLM Failover] ChatGPT limit detected but conversation is empty.");
+      return;
+    }
+
+    console.log(`[LLM Failover] ChatGPT limit detected. Extracted ${messages.length} messages.`);
+
+    chrome.runtime.sendMessage({
+      type: "LIMIT_REACHED",
+      payload: {
+        sourcePlatform: "chatgpt",
+        messages,
+        pageUrl: window.location.href,
+      },
+    });
+
+    showToast(messages);
+  }
+
+  // ─── Floating Toast UI Injection ──────────────────────────────────────────
 
   function showToast(messages) {
-    // Check if toast already exists
     if (document.getElementById('llm-failover-toast-root')) {
       return;
     }
@@ -127,7 +179,7 @@
     container.style.position = 'fixed';
     container.style.bottom = '24px';
     container.style.right = '24px';
-    container.style.zIndex = '2147483647'; // max z-index
+    container.style.zIndex = '2147483647';
     container.style.pointerEvents = 'none';
 
     const shadow = container.attachShadow({ mode: 'open' });
@@ -274,17 +326,17 @@
         transform: scale(0.98);
       }
 
-      .btn-chatgpt {
-        background: rgba(16, 163, 127, 0.15);
-        color: #10a37f;
-        border: 1px solid rgba(16, 163, 127, 0.3);
+      .btn-claude {
+        background: rgba(217, 119, 6, 0.15);
+        color: #d97706;
+        border: 1px solid rgba(217, 119, 6, 0.3);
       }
 
-      .btn-chatgpt:hover {
-        background: #10a37f;
+      .btn-claude:hover {
+        background: #d97706;
         color: #ffffff;
-        box-shadow: 0 0 16px rgba(16, 163, 127, 0.4);
-        border-color: #10a37f;
+        box-shadow: 0 0 16px rgba(217, 119, 6, 0.4);
+        border-color: #d97706;
       }
 
       .btn-gemini {
@@ -311,21 +363,22 @@
       <div class="header">
         <div class="title-container">
           <div class="icon-bolt">⚡</div>
-          <h3 class="title">Claude Limit Reached</h3>
+          <h3 class="title">ChatGPT Limit Reached</h3>
         </div>
         <button class="close-btn" id="toast-close-btn" aria-label="Close">&times;</button>
       </div>
-      <p class="body-text">You've hit the rate limit on Claude. Switch platform to continue your conversation seamlessly.</p>
+      <p class="body-text">You've hit the rate limit on ChatGPT. Switch platform to continue your conversation seamlessly.</p>
       <div class="stats-badge">
         <span class="stats-dot"></span>
         <span id="toast-stats-text">${messages.length} messages captured</span>
       </div>
       <div class="actions-container">
-        <button class="btn btn-chatgpt" id="toast-btn-chatgpt">
-          <svg class="brand-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
+        <button class="btn btn-claude" id="toast-btn-claude">
+          <svg class="brand-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M9.813 15.904L9 21L14.187 20.096L15 15L9.813 15.904Z" />
+            <path stroke-linecap="round" stroke-linejoin="round" d="M14.187 8.096L15 3L9.813 3.904L9 9L14.187 8.096Z" />
           </svg>
-          Continue on ChatGPT
+          Continue on Claude
         </button>
         <button class="btn btn-gemini" id="toast-btn-gemini">
           <svg class="brand-icon" viewBox="0 0 24 24" fill="currentColor">
@@ -345,7 +398,7 @@
     }, 50);
 
     const closeBtn = shadow.getElementById('toast-close-btn');
-    const chatgptBtn = shadow.getElementById('toast-btn-chatgpt');
+    const claudeBtn = shadow.getElementById('toast-btn-claude');
     const geminiBtn = shadow.getElementById('toast-btn-gemini');
 
     const dismissToast = () => {
@@ -360,10 +413,10 @@
       dismissToast();
     });
 
-    chatgptBtn.addEventListener('click', () => {
+    claudeBtn.addEventListener('click', () => {
       chrome.runtime.sendMessage({
         type: "CONFIRM_SWITCH",
-        payload: { targetPlatform: "chatgpt" }
+        payload: { targetPlatform: "claude" }
       });
       dismissToast();
     });
@@ -377,35 +430,7 @@
     });
   }
 
-  function notifyLimitReached() {
-    if (limitDetected) return; // fire only once
-    limitDetected = true;
-
-    const messages = extractConversation();
-
-    if (messages.length === 0) {
-      console.warn("[LLM Failover] Limit detected but no messages found.");
-      return;
-    }
-
-    console.log(
-      `[LLM Failover] Rate limit detected. Extracted ${messages.length} messages.`
-    );
-
-    chrome.runtime.sendMessage({
-      type: "CLAUDE_LIMIT_REACHED",
-      payload: {
-        sourcePlatform: "claude",
-        messages,
-        pageUrl: window.location.href,
-      },
-    });
-
-    showToast(messages);
-  }
-
   // ─── MutationObserver ─────────────────────────────────────────────────────
-  // Watches the DOM for limit banners appearing dynamically
 
   function startObserver() {
     observer = new MutationObserver(() => {
@@ -421,80 +446,17 @@
     });
   }
 
-  // ─── Init ─────────────────────────────────────────────────────────────────
-
   function init() {
-    // Check immediately on load (in case page was refreshed after limit)
     if (isLimitReached()) {
       notifyLimitReached();
     } else {
-      // Otherwise watch for it to appear
       startObserver();
     }
   }
 
-  // Wait for DOM to be ready
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", init);
   } else {
     init();
-  }
-
-  // ─── Listen for messages (manual extraction and context injection) ────────
-
-  chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-    if (msg.type === "EXTRACT_CONVERSATION") {
-      const messages = extractConversation();
-      sendResponse({ success: true, messages });
-    }
-    if (msg.type === "INJECT_CONTEXT") {
-      injectPrompt(msg.payload.prompt, msg.payload.autoSubmit);
-      sendResponse({ success: true });
-    }
-    return true; // keep channel open for async response
-  });
-
-  function injectPrompt(promptText, autoSubmit) {
-    const input =
-      document.querySelector('div[contenteditable="true"]') ||
-      document.querySelector('div[role="textbox"]') ||
-      document.querySelector('div.ProseMirror');
-
-    if (!input) {
-      console.error("[LLM Failover] Claude input not found. Retrying...");
-      setTimeout(() => injectPrompt(promptText, autoSubmit), 1500);
-      return;
-    }
-
-    input.focus();
-    input.innerHTML = "";
-    document.execCommand("insertText", false, promptText);
-
-    if (!input.innerText.trim()) {
-      input.innerText = promptText;
-      input.dispatchEvent(new Event("input", { bubbles: true }));
-    }
-
-    console.log("[LLM Failover] Prompt injected into Claude.");
-
-    if (autoSubmit !== false) {
-      setTimeout(() => {
-        submitPrompt();
-      }, 600);
-    }
-  }
-
-  function submitPrompt() {
-    const sendBtn =
-      document.querySelector('button[aria-label="Send message"]') ||
-      document.querySelector('button[aria-label="Send prompt"]') ||
-      document.querySelector('button[aria-label="Submit prompt"]');
-
-    if (sendBtn && !sendBtn.disabled) {
-      sendBtn.click();
-      console.log("[LLM Failover] Prompt submitted to Claude.");
-    } else {
-      console.warn("[LLM Failover] Claude send button not found or disabled.");
-    }
   }
 })();

@@ -30,34 +30,74 @@ chrome.runtime.sendMessage({ type: "GET_PENDING_CONTEXT" }, (response) => {
   if (ctx) {
     renderSwitchPrompt(ctx);
   } else {
-    // 2. No auto-detected limit: check if user is currently on Claude to allow manual switch
+    // 2. No auto-detected limit: check if user is currently on an LLM to allow manual switch
     checkActiveTab();
   }
 });
 
 function checkActiveTab() {
   chrome.tabs.query({ active: true }, (tabs) => {
-    // Filter out extension pages to find the actual active web page
+    // Find active tab that is not an extension page
     const activeTab = tabs.find(tab => tab.url && !tab.url.startsWith("chrome-extension://"));
     
     if (activeTab) {
       handleTab(activeTab);
     } else {
       // Fallback for E2E testing where the popup is loaded as a tab
-      chrome.tabs.query({ url: "*://*.claude.ai/*" }, (claudeTabs) => {
-        const firstClaudeTab = claudeTabs[0];
-        handleTab(firstClaudeTab);
+      chrome.tabs.query({}, (allTabs) => {
+        const monitoredTabs = allTabs.filter(tab => 
+          tab.url && (
+            tab.url.includes("claude.ai") || 
+            tab.url.includes("chatgpt.com") || 
+            tab.url.includes("chat.openai.com") || 
+            tab.url.includes("gemini.google.com")
+          )
+        );
+        // Sort by lastAccessed descending to find the most recently viewed tab
+        monitoredTabs.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0));
+        
+        if (monitoredTabs.length > 0) {
+          handleTab(monitoredTabs[0]);
+        } else {
+          renderEmpty();
+        }
       });
     }
   });
 
   function handleTab(tab) {
-    if (tab && tab.url && tab.url.includes("claude.ai")) {
-      renderManualPrompt(tab);
+    if (!tab || !tab.url) {
+      renderEmpty();
+      return;
+    }
+
+    if (tab.url.includes("claude.ai")) {
+      renderManualPrompt(tab, "claude", ["chatgpt", "gemini"]);
+    } else if (tab.url.includes("chatgpt.com") || tab.url.includes("chat.openai.com")) {
+      renderManualPrompt(tab, "chatgpt", ["claude", "gemini"]);
+    } else if (tab.url.includes("gemini.google.com")) {
+      renderManualPrompt(tab, "gemini", ["claude", "chatgpt"]);
     } else {
       renderEmpty();
     }
   }
+}
+
+// ─── Render Helpers ───────────────────────────────────────────────────────────
+
+function getButtonHtml(target, actionType = "switch") {
+  const isClaude = target === "claude";
+  const isGemini = target === "gemini";
+  
+  const targetLabel = isClaude ? "Claude" : (isGemini ? "Gemini" : "ChatGPT");
+  const actionText = actionType === "switch" ? `Continue on ${targetLabel}` : `Transfer to ${targetLabel}`;
+  const customClass = `btn-${target}`;
+  
+  return `
+    <button class="btn ${customClass}" id="btn-${target}" data-target="${target}">
+      <span>${actionText}</span>
+    </button>
+  `;
 }
 
 // ─── Render: Auto-Limit Switch Prompt ─────────────────────────────────────────
@@ -68,8 +108,33 @@ function renderSwitchPrompt(ctx) {
     ? `"${lastMsg.content.slice(0, 120)}${lastMsg.content.length > 120 ? "…" : ""}"`
     : "No preview available.";
 
+  const source = ctx.sourcePlatform;
+  let targets = [];
+  if (source === "claude") {
+    targets = ["chatgpt", "gemini"];
+  } else if (source === "chatgpt") {
+    targets = ["claude", "gemini"];
+  } else if (source === "gemini") {
+    targets = ["claude", "chatgpt"];
+  }
+
+  const sourceLabel = source === "claude" ? "Claude" : (source === "gemini" ? "Gemini" : "ChatGPT");
+
+  let buttonsHtml = "";
+  targets.forEach(target => {
+    buttonsHtml += getButtonHtml(target, "switch");
+  });
+
+  buttonsHtml += `
+    <button class="btn btn-secondary" id="btn-dismiss">
+      Dismiss
+    </button>
+  `;
+
   content.innerHTML = `
-    <div class="status-badge">⚠️ Rate Limit Detected</div>
+    <div class="status-badge" style="background: rgba(239, 68, 68, 0.1); color: #ef4444; border-color: rgba(239, 68, 68, 0.2);">
+      ⚠️ ${sourceLabel} Limit Detected
+    </div>
     
     <div class="card">
       <div class="card-title">Captured Conversation</div>
@@ -80,21 +145,14 @@ function renderSwitchPrompt(ctx) {
     </div>
 
     <div class="btn-group">
-      <button class="btn btn-chatgpt" id="btn-chatgpt" data-target="chatgpt">
-        <span>Continue on ChatGPT</span>
-      </button>
-      <button class="btn btn-gemini" id="btn-gemini" data-target="gemini">
-        <span>Continue on Gemini</span>
-      </button>
-      <button class="btn btn-secondary" id="btn-dismiss">
-        Dismiss
-      </button>
+      ${buttonsHtml}
     </div>
   `;
 
   // Wire switch actions
-  document.getElementById("btn-chatgpt").addEventListener("click", () => triggerSwitch("chatgpt"));
-  document.getElementById("btn-gemini").addEventListener("click", () => triggerSwitch("gemini"));
+  targets.forEach(target => {
+    document.getElementById(`btn-${target}`).addEventListener("click", () => triggerSwitch(target));
+  });
   
   document.getElementById("btn-dismiss").addEventListener("click", () => {
     chrome.runtime.sendMessage({ type: "DISMISS_SWITCH" }, () => {
@@ -105,16 +163,25 @@ function renderSwitchPrompt(ctx) {
 
 // ─── Render: Manual Failover Prompt ───────────────────────────────────────────
 
-function renderManualPrompt(tab) {
+function renderManualPrompt(tab, sourcePlatform, targets) {
+  const sourceLabel = sourcePlatform === "claude" ? "Claude" : (sourcePlatform === "gemini" ? "Gemini" : "ChatGPT");
+  const sourceLogo = sourcePlatform === "claude" ? "🎨" : (sourcePlatform === "gemini" ? "✨" : "💬");
+  const logoClass = `platform-logo ${sourcePlatform}`;
+
+  let buttonsHtml = "";
+  targets.forEach(target => {
+    buttonsHtml += getButtonHtml(target, "manual");
+  });
+
   content.innerHTML = `
     <div class="status-badge" style="background: rgba(245, 158, 11, 0.1); color: #f59e0b; border-color: rgba(245, 158, 11, 0.2);">
-      🟢 Monitoring Claude.ai
+      🟢 Monitoring ${sourceLabel}
     </div>
 
     <div class="flow-display">
       <div class="flow-node">
-        <div class="platform-logo claude">🎨</div>
-        <span>Claude</span>
+        <div class="${logoClass}">${sourceLogo}</div>
+        <span>${sourceLabel}</span>
       </div>
       <div class="flow-arrow">→</div>
       <div class="flow-node">
@@ -128,17 +195,14 @@ function renderManualPrompt(tab) {
     </div>
 
     <div class="btn-group">
-      <button class="btn btn-chatgpt" id="btn-chatgpt">
-        <span>Transfer to ChatGPT</span>
-      </button>
-      <button class="btn btn-gemini" id="btn-gemini">
-        <span>Transfer to Gemini</span>
-      </button>
+      ${buttonsHtml}
     </div>
   `;
 
-  document.getElementById("btn-chatgpt").addEventListener("click", () => runManualFailover(tab, "chatgpt"));
-  document.getElementById("btn-gemini").addEventListener("click", () => runManualFailover(tab, "gemini"));
+  // Wire manual failover actions
+  targets.forEach(target => {
+    document.getElementById(`btn-${target}`).addEventListener("click", () => runManualFailover(tab, target));
+  });
 }
 
 // ─── Render: Empty State ──────────────────────────────────────────────────────
@@ -151,9 +215,9 @@ function renderEmpty() {
 
     <div class="info-box" style="padding: 20px 0;">
       <div class="icon">⚡</div>
-      <p>Start a conversation on <strong style="color: var(--text-primary);">Claude.ai</strong>.</p>
+      <p>Start a conversation on <strong style="color: var(--text-primary);">Claude, ChatGPT, or Gemini</strong>.</p>
       <p style="font-size: 11px; margin-top: 6px; color: var(--text-muted);">
-        LLM Failover will watch for rate limits, or you can open the popup on Claude to switch manually.
+        LLM Failover will watch for rate limits on these platforms, or you can open this popup to switch manually at any time.
       </p>
     </div>
   `;
@@ -171,26 +235,33 @@ function triggerSwitch(targetPlatform) {
 }
 
 function runManualFailover(tab, targetPlatform) {
-  // Show a loading/processing message on the button
-  const btn = document.getElementById(targetPlatform === "chatgpt" ? "btn-chatgpt" : "btn-gemini");
-  const originalText = targetPlatform === "chatgpt" ? "Transfer to ChatGPT" : "Transfer to Gemini";
+  const btn = document.getElementById(`btn-${targetPlatform}`);
+  const targetLabel = targetPlatform === "claude" ? "Claude" : (targetPlatform === "gemini" ? "Gemini" : "ChatGPT");
+  const originalText = `Transfer to ${targetLabel}`;
+  
   btn.innerHTML = `<span style="opacity: 0.7;">Extracting context...</span>`;
   btn.disabled = true;
 
   chrome.tabs.sendMessage(tab.id, { type: "EXTRACT_CONVERSATION" }, async (response) => {
-    // Check if the script failed to respond (e.g. extension loaded after page load, requiring refresh)
     if (chrome.runtime.lastError || !response) {
       console.error("[LLM Failover] Extension content script not responding.", chrome.runtime.lastError);
-      btn.innerText = "Refresh Claude page & try again";
+      btn.innerText = "Refresh page & try again";
       btn.disabled = false;
       setTimeout(() => { btn.innerText = originalText; }, 5000);
       return;
     }
 
     if (response.success && response.messages && response.messages.length > 0) {
-      // Structure the pending context
+      // Determine the source platform from the active tab url
+      let sourcePlatform = "claude";
+      if (tab.url.includes("chatgpt.com") || tab.url.includes("chat.openai.com")) {
+        sourcePlatform = "chatgpt";
+      } else if (tab.url.includes("gemini.google.com")) {
+        sourcePlatform = "gemini";
+      }
+
       const context = {
-        sourcePlatform: "claude",
+        sourcePlatform,
         extractedAt: new Date().toISOString(),
         messageCount: response.messages.length,
         messages: response.messages.map((m) => ({
@@ -201,10 +272,7 @@ function runManualFailover(tab, targetPlatform) {
         sourceTabUrl: tab.url,
       };
 
-      // Persist directly into storage
       await chrome.storage.local.set({ pendingContext: context });
-
-      // Trigger switch directly
       triggerSwitch(targetPlatform);
     } else {
       console.warn("[LLM Failover] No messages found to extract.");

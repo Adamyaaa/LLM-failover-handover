@@ -36,7 +36,7 @@ function buildInjectionPrompt(context) {
 // ─── Message Listener ─────────────────────────────────────────────────────────
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg.type === "CLAUDE_LIMIT_REACHED") {
+  if (msg.type === "CLAUDE_LIMIT_REACHED" || msg.type === "LIMIT_REACHED") {
     handleLimitReached(msg.payload, sender.tab);
     sendResponse({ received: true });
   }
@@ -111,11 +111,22 @@ async function handleConfirmedSwitch(targetPlatform) {
   // Save the prompt so the content script can pick it up on load
   await chrome.storage.local.set({ pendingInjection: prompt });
 
-  // Resolve target platform configuration
-  const isGemini = targetPlatform === "gemini";
-  const targetUrl = isGemini ? "https://gemini.google.com/" : "https://chatgpt.com/";
-  const queryUrl = isGemini ? "*://gemini.google.com/*" : "*://chatgpt.com/*";
-  const contentScript = isGemini ? "content-scripts/gemini-ready.js" : "content-scripts/chatgpt-ready.js";
+  // Resolve target platform configuration dynamically
+  let targetUrl, queryUrl, contentScript;
+  if (targetPlatform === "claude") {
+    targetUrl = "https://claude.ai/new";
+    queryUrl = "*://*.claude.ai/*";
+    contentScript = "content-scripts/claude.js";
+  } else if (targetPlatform === "gemini") {
+    targetUrl = "https://gemini.google.com/";
+    queryUrl = "*://*.gemini.google.com/*";
+    contentScript = "content-scripts/gemini.js";
+  } else {
+    // chatgpt
+    targetUrl = "https://chatgpt.com/";
+    queryUrl = "*://*.chatgpt.com/*";
+    contentScript = "content-scripts/chatgpt.js";
+  }
 
   // Reuse existing tab if available, otherwise open a new one
   const existingTabs = await chrome.tabs.query({ url: queryUrl });

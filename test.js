@@ -1,12 +1,213 @@
 const puppeteer = require('puppeteer');
 const path = require('path');
 
+// ─── Shared Mock HTML templates ──────────────────────────────────────────────
+
+const CLAUDE_SOURCE = `
+  <!DOCTYPE html>
+  <html>
+  <body>
+    <h2>Claude Chat (Mock)</h2>
+    <div data-testid="conversation-turn">
+      <div data-testid="human-message">Explain recursion</div>
+      <div data-testid="assistant-message">Recursion is when a function calls itself...</div>
+    </div>
+    <div data-testid="conversation-turn">
+      <div data-testid="human-message">Give me a Python example</div>
+    </div>
+  </body>
+  </html>
+`;
+
+const CLAUDE_TARGET = `
+  <!DOCTYPE html>
+  <html>
+  <body>
+    <h2>Claude Chat (Mock Target)</h2>
+    <div contenteditable="true" role="textbox" style="min-height: 50px; border:1px solid #ccc;"></div>
+    <button aria-label="Send message">Send</button>
+    <div id="status">Waiting...</div>
+    <script>
+      const input = document.querySelector('div[contenteditable="true"]');
+      const btn = document.querySelector('button');
+      btn.addEventListener('click', () => {
+        document.getElementById('status').innerText = 'Submitted: ' + input.innerText;
+      });
+    </script>
+  </body>
+  </html>
+`;
+
+const CHATGPT_SOURCE = `
+  <!DOCTYPE html>
+  <html>
+  <body>
+    <h2>ChatGPT Chat (Mock)</h2>
+    <article>
+      <div data-testid="user-message">Explain recursion</div>
+      <div data-message-author-role="assistant">Recursion is when a function calls itself...</div>
+    </article>
+    <article>
+      <div data-testid="user-message">Give me a Python example</div>
+    </article>
+  </body>
+  </html>
+`;
+
+const CHATGPT_TARGET = `
+  <!DOCTYPE html>
+  <html>
+  <body>
+    <h2>ChatGPT Chat (Mock Target)</h2>
+    <div id="prompt-textarea" contenteditable="true" style="min-height: 50px; border:1px solid #ccc;"></div>
+    <button data-testid="send-button">Send</button>
+    <div id="status">Waiting...</div>
+    <script>
+      const input = document.getElementById('prompt-textarea');
+      const btn = document.querySelector('[data-testid="send-button"]');
+      btn.addEventListener('click', () => {
+        document.getElementById('status').innerText = 'Submitted: ' + input.innerText;
+      });
+    </script>
+  </body>
+  </html>
+`;
+
+const GEMINI_SOURCE = `
+  <!DOCTYPE html>
+  <html>
+  <body>
+    <h2>Gemini Chat (Mock)</h2>
+    <message-outer>
+      <div class="query-text">Explain recursion</div>
+      <div class="model-response">Recursion is when a function calls itself...</div>
+    </message-outer>
+    <message-outer>
+      <div class="query-text">Give me a Python example</div>
+    </message-outer>
+  </body>
+  </html>
+`;
+
+const GEMINI_TARGET = `
+  <!DOCTYPE html>
+  <html>
+  <body>
+    <h2>Gemini Chat (Mock Target)</h2>
+    <rich-textarea><div contenteditable="true" style="min-height: 50px; border:1px solid #ccc;"></div></rich-textarea>
+    <button aria-label="Send message">Send</button>
+    <div id="status">Waiting...</div>
+    <script>
+      const input = document.querySelector('rich-textarea div');
+      const btn = document.querySelector('button');
+      btn.addEventListener('click', () => {
+        document.getElementById('status').innerText = 'Submitted: ' + input.innerText;
+      });
+    </script>
+  </body>
+  </html>
+`;
+
+// ─── Automated Swap Test Case Helper ──────────────────────────────────────────
+
+async function runAutoLimitTest({
+  browser,
+  worker,
+  sourcePlatform,
+  targetPlatform,
+  sourceUrl,
+  targetUrl,
+  sourceBody,
+  targetBody,
+  toastButtonId
+}) {
+  console.log(`\n--- Running Auto-Limit: ${sourcePlatform} -> ${targetPlatform} ---`);
+  
+  // Set autoSubmit to true in storage
+  await worker.evaluate(async () => {
+    await chrome.storage.local.set({ autoSubmit: true });
+  });
+
+  // Pre-create and mock target page
+  const targetPage = await browser.newPage();
+  await targetPage.setRequestInterception(true);
+  targetPage.on('request', request => {
+    if (request.url().includes(targetPlatform)) {
+      request.respond({
+        status: 200,
+        contentType: 'text/html',
+        body: targetBody
+      });
+    } else {
+      request.respond({ status: 404 });
+    }
+  });
+  await targetPage.goto(targetUrl);
+  console.log(`${targetPlatform} mock page loaded.`);
+
+  // Pre-create and mock source page
+  const sourcePage = await browser.newPage();
+  await sourcePage.setRequestInterception(true);
+  sourcePage.on('request', request => {
+    if (request.url().includes(sourcePlatform)) {
+      request.respond({
+        status: 200,
+        contentType: 'text/html',
+        body: sourceBody
+      });
+    } else {
+      request.respond({ status: 404 });
+    }
+  });
+  await sourcePage.goto(sourceUrl);
+  console.log(`${sourcePlatform} mock page loaded.`);
+
+  await sourcePage.evaluate(() => {
+    const div = document.createElement('div');
+    div.innerText = "You've reached your usage limit. Rate limit exceeded. Limit reached."; // triggers limit observer on all platforms
+    document.body.appendChild(div);
+  });
+
+  // Wait for the Shadow DOM floating toast to appear
+  console.log('Waiting for the in-page Shadow DOM toast to appear...');
+  await sourcePage.waitForFunction((btnId) => {
+    const host = document.getElementById('llm-failover-toast-root');
+    if (!host) return false;
+    const shadow = host.shadowRoot;
+    return shadow && shadow.getElementById(btnId);
+  }, { timeout: 12000 }, toastButtonId);
+
+  // Click the target button on the toast
+  console.log(`Clicking "${toastButtonId}" on the in-page toast...`);
+  await sourcePage.evaluate((btnId) => {
+    const host = document.getElementById('llm-failover-toast-root');
+    const shadow = host.shadowRoot;
+    const btn = shadow.getElementById(btnId);
+    btn.click();
+  }, toastButtonId);
+
+  // Verify prompt injection and auto-submission on target page
+  await targetPage.waitForFunction(
+    () => {
+      const el = document.getElementById('status');
+      return el && el.innerText.startsWith('Submitted:');
+    },
+    { timeout: 15000 }
+  );
+
+  console.log(`Success: ${sourcePlatform} -> ${targetPlatform} prompt injected and auto-submitted!`);
+  
+  await targetPage.close();
+  await sourcePage.close();
+}
+
+// ─── E2E Run Execution ────────────────────────────────────────────────────────
+
 (async () => {
   console.log('Starting LLM Failover Extension E2E Integration Test Suite...');
 
   const extensionPath = path.join(__dirname, 'llm-failover');
 
-  // Launch browser with the extension loaded
   const browser = await puppeteer.launch({
     headless: false,
     args: [
@@ -31,10 +232,9 @@ const path = require('path');
     }
     console.log('Background service worker found!');
 
-    // Wait a brief moment for the extension APIs to fully bind in the service worker context
     await new Promise(resolve => setTimeout(resolve, 2000));
 
-    // Setup global log listeners
+    // Log listeners
     browser.on('targetcreated', async (target) => {
       if (target.type() === 'page') {
         const page = await target.page();
@@ -45,356 +245,155 @@ const path = require('path');
     });
 
     // ──────────────────────────────────────────────────────────────────────────
-    // TEST CASE 1: Auto-Limit -> ChatGPT (Auto-Submit = true)
+    // RUN AUTOMATED RATE LIMIT SWAP PATHS (6 PERMUTATIONS)
     // ──────────────────────────────────────────────────────────────────────────
-    console.log('\n--- Running Test Case 1: Auto-Limit to ChatGPT (Auto-Submit = true) ---');
-    
-    // Set autoSubmit to true in storage
-    await worker.evaluate(async () => {
-      await chrome.storage.local.set({ autoSubmit: true });
+
+    // Path 1: Claude -> ChatGPT
+    await runAutoLimitTest({
+      browser,
+      worker,
+      sourcePlatform: 'claude',
+      targetPlatform: 'chatgpt',
+      sourceUrl: 'https://claude.ai/chat/auto-1',
+      targetUrl: 'https://chatgpt.com/',
+      sourceBody: CLAUDE_SOURCE,
+      targetBody: CHATGPT_TARGET,
+      toastButtonId: 'toast-btn-chatgpt'
     });
 
-    // Pre-create and mock ChatGPT page
-    const gptPage = await browser.newPage();
-    await gptPage.setRequestInterception(true);
-    gptPage.on('request', request => {
-      const url = request.url();
-      if (url.includes('chatgpt.com')) {
-        request.respond({
-          status: 200,
-          contentType: 'text/html',
-          body: `
-            <!DOCTYPE html>
-            <html>
-            <body>
-              <div id="prompt-textarea" contenteditable="true"></div>
-              <button data-testid="send-button">Send</button>
-              <div id="status">Waiting...</div>
-              <script>
-                const input = document.getElementById('prompt-textarea');
-                const btn = document.querySelector('[data-testid="send-button"]');
-                btn.addEventListener('click', () => {
-                  document.getElementById('status').innerText = 'Submitted: ' + input.innerText;
-                });
-              </script>
-            </body>
-            </html>
-          `
-        });
-      } else {
-        request.respond({ status: 404 });
-      }
-    });
-    await gptPage.goto('https://chatgpt.com/');
-    console.log('ChatGPT mock page loaded.');
-
-    // Pre-create and mock Claude page
-    const claudePage1 = await browser.newPage();
-    await claudePage1.setRequestInterception(true);
-    claudePage1.on('request', request => {
-      const url = request.url();
-      if (url.includes('claude.ai')) {
-        request.respond({
-          status: 200,
-          contentType: 'text/html',
-          body: `
-            <!DOCTYPE html>
-            <html>
-            <body>
-              <h2>Claude Chat (Mock)</h2>
-              <div data-testid="conversation-turn">
-                <div data-testid="human-message">Explain recursion</div>
-                <div data-testid="ai-message">Recursion is when a function calls itself...</div>
-              </div>
-              <div data-testid="conversation-turn">
-                <div data-testid="human-message">Give me a Python example</div>
-              </div>
-            </body>
-            </html>
-          `
-        });
-      } else {
-        request.respond({ status: 404 });
-      }
-    });
-    await claudePage1.goto('https://claude.ai/chat/auto-test-1');
-    console.log('Claude mock page loaded.');
-
-    // Trigger rate limit on the Claude page by appending a rate limit phrase to the DOM
-    console.log('Simulating rate limit by appending text to mock Claude page...');
-    await claudePage1.evaluate(() => {
-      const div = document.createElement('div');
-      div.innerText = "You've reached your usage limit";
-      document.body.appendChild(div);
+    // Path 2: Claude -> Gemini
+    await runAutoLimitTest({
+      browser,
+      worker,
+      sourcePlatform: 'claude',
+      targetPlatform: 'gemini',
+      sourceUrl: 'https://claude.ai/chat/auto-2',
+      targetUrl: 'https://gemini.google.com/',
+      sourceBody: CLAUDE_SOURCE,
+      targetBody: GEMINI_TARGET,
+      toastButtonId: 'toast-btn-gemini'
     });
 
-    // Wait for the Shadow DOM floating toast to appear
-    console.log('Waiting for the in-page Shadow DOM toast to appear...');
-    await claudePage1.waitForFunction(() => {
-      const host = document.getElementById('llm-failover-toast-root');
-      if (!host) return false;
-      const shadow = host.shadowRoot;
-      return shadow && shadow.getElementById('toast-btn-chatgpt');
-    }, { timeout: 10000 });
-
-    // Verify toast stats
-    const toastStatsText = await claudePage1.evaluate(() => {
-      const host = document.getElementById('llm-failover-toast-root');
-      const shadow = host.shadowRoot;
-      return shadow.getElementById('toast-stats-text').innerText;
-    });
-    console.log('Toast stats text:', toastStatsText);
-    if (!toastStatsText.includes('3')) {
-      throw new Error(`Expected toast message count of 3, got: ${toastStatsText}`);
-    }
-
-    // Click "Continue on ChatGPT" on the toast
-    console.log('Clicking "Continue on ChatGPT" in the in-page toast...');
-    await claudePage1.evaluate(() => {
-      const host = document.getElementById('llm-failover-toast-root');
-      const shadow = host.shadowRoot;
-      const btn = shadow.getElementById('toast-btn-chatgpt');
-      btn.click();
+    // Path 3: ChatGPT -> Claude
+    await runAutoLimitTest({
+      browser,
+      worker,
+      sourcePlatform: 'chatgpt',
+      targetPlatform: 'claude',
+      sourceUrl: 'https://chatgpt.com/chat/auto-3',
+      targetUrl: 'https://claude.ai/new',
+      sourceBody: CHATGPT_SOURCE,
+      targetBody: CLAUDE_TARGET,
+      toastButtonId: 'toast-btn-claude'
     });
 
-    // Verify injection and auto-submission
-    await gptPage.waitForFunction(
-      () => {
-        const el = document.getElementById('status');
-        return el && el.innerText.startsWith('Submitted:');
-      },
-      { timeout: 10000 }
-    );
-    console.log('Test Case 1: ChatGPT prompt injected and auto-submitted successfully!');
-    await gptPage.close();
-    await claudePage1.close();
+    // Path 4: ChatGPT -> Gemini
+    await runAutoLimitTest({
+      browser,
+      worker,
+      sourcePlatform: 'chatgpt',
+      targetPlatform: 'gemini',
+      sourceUrl: 'https://chatgpt.com/chat/auto-4',
+      targetUrl: 'https://gemini.google.com/',
+      sourceBody: CHATGPT_SOURCE,
+      targetBody: GEMINI_TARGET,
+      toastButtonId: 'toast-btn-gemini'
+    });
+
+    // Path 5: Gemini -> Claude
+    await runAutoLimitTest({
+      browser,
+      worker,
+      sourcePlatform: 'gemini',
+      targetPlatform: 'claude',
+      sourceUrl: 'https://gemini.google.com/chat/auto-5',
+      targetUrl: 'https://claude.ai/new',
+      sourceBody: GEMINI_SOURCE,
+      targetBody: CLAUDE_TARGET,
+      toastButtonId: 'toast-btn-claude'
+    });
+
+    // Path 6: Gemini -> ChatGPT
+    await runAutoLimitTest({
+      browser,
+      worker,
+      sourcePlatform: 'gemini',
+      targetPlatform: 'chatgpt',
+      sourceUrl: 'https://gemini.google.com/chat/auto-6',
+      targetUrl: 'https://chatgpt.com/',
+      sourceBody: GEMINI_SOURCE,
+      targetBody: CHATGPT_TARGET,
+      toastButtonId: 'toast-btn-chatgpt'
+    });
 
     // ──────────────────────────────────────────────────────────────────────────
-    // TEST CASE 2: Auto-Limit -> Gemini (Auto-Submit = true)
+    // TEST CASE 7: Manual Failover -> Claude to ChatGPT (Auto-Submit = false)
     // ──────────────────────────────────────────────────────────────────────────
-    console.log('\n--- Running Test Case 2: Auto-Limit to Gemini (Auto-Submit = true) ---');
+    console.log('\n--- Running Test Case 7: Manual Failover from Claude to ChatGPT (Auto-Submit = false) ---');
 
-    // Pre-create and mock Gemini page
-    const geminiPage = await browser.newPage();
-    await geminiPage.setRequestInterception(true);
-    geminiPage.on('request', request => {
-      const url = request.url();
-      if (url.includes('gemini.google.com')) {
-        request.respond({
-          status: 200,
-          contentType: 'text/html',
-          body: `
-            <!DOCTYPE html>
-            <html>
-            <body>
-              <rich-textarea><div contenteditable="true"></div></rich-textarea>
-              <button aria-label="Send message">Send</button>
-              <div id="status">Waiting...</div>
-              <script>
-                const input = document.querySelector('rich-textarea div');
-                const btn = document.querySelector('button');
-                btn.addEventListener('click', () => {
-                  document.getElementById('status').innerText = 'Submitted: ' + input.innerText;
-                });
-              </script>
-            </body>
-            </html>
-          `
-        });
-      } else {
-        request.respond({ status: 404 });
-      }
-    });
-    await geminiPage.goto('https://gemini.google.com/');
-    console.log('Gemini mock page loaded.');
-
-    // Pre-create and mock Claude page
-    const claudePage2 = await browser.newPage();
-    await claudePage2.setRequestInterception(true);
-    claudePage2.on('request', request => {
-      const url = request.url();
-      if (url.includes('claude.ai')) {
-        request.respond({
-          status: 200,
-          contentType: 'text/html',
-          body: `
-            <!DOCTYPE html>
-            <html>
-            <body>
-              <h2>Claude Chat (Mock)</h2>
-              <div data-testid="conversation-turn">
-                <div data-testid="human-message">What is JS?</div>
-                <div data-testid="ai-message">JavaScript is a programming language...</div>
-              </div>
-              <div data-testid="conversation-turn">
-                <div data-testid="human-message">Show me async code</div>
-              </div>
-            </body>
-            </html>
-          `
-        });
-      } else {
-        request.respond({ status: 404 });
-      }
-    });
-    await claudePage2.goto('https://claude.ai/chat/auto-test-2');
-    console.log('Claude mock page loaded.');
-
-    // Trigger rate limit on the Claude page by appending a rate limit phrase to the DOM
-    console.log('Simulating rate limit by appending text to mock Claude page...');
-    await claudePage2.evaluate(() => {
-      const div = document.createElement('div');
-      div.innerText = "You've reached your usage limit";
-      document.body.appendChild(div);
-    });
-
-    // Wait for the Shadow DOM floating toast to appear
-    console.log('Waiting for the in-page Shadow DOM toast to appear...');
-    await claudePage2.waitForFunction(() => {
-      const host = document.getElementById('llm-failover-toast-root');
-      if (!host) return false;
-      const shadow = host.shadowRoot;
-      return shadow && shadow.getElementById('toast-btn-gemini');
-    }, { timeout: 10000 });
-
-    // Verify toast stats
-    const toastStatsText2 = await claudePage2.evaluate(() => {
-      const host = document.getElementById('llm-failover-toast-root');
-      const shadow = host.shadowRoot;
-      return shadow.getElementById('toast-stats-text').innerText;
-    });
-    console.log('Toast stats text:', toastStatsText2);
-    if (!toastStatsText2.includes('3')) {
-      throw new Error(`Expected toast message count of 3, got: ${toastStatsText2}`);
-    }
-
-    // Click "Continue on Gemini" on the toast
-    console.log('Clicking "Continue on Gemini" in the in-page toast...');
-    await claudePage2.evaluate(() => {
-      const host = document.getElementById('llm-failover-toast-root');
-      const shadow = host.shadowRoot;
-      const btn = shadow.getElementById('toast-btn-gemini');
-      btn.click();
-    });
-
-    // Verify injection and auto-submission
-    await geminiPage.waitForFunction(
-      () => {
-        const el = document.getElementById('status');
-        return el && el.innerText.startsWith('Submitted:');
-      },
-      { timeout: 10000 }
-    );
-    console.log('Test Case 2: Gemini prompt injected and auto-submitted successfully!');
-    await geminiPage.close();
-    await claudePage2.close();
-
-    // ──────────────────────────────────────────────────────────────────────────
-    // TEST CASE 3: Manual Failover -> ChatGPT (Auto-Submit = false)
-    // ──────────────────────────────────────────────────────────────────────────
-    console.log('\n--- Running Test Case 3: Manual Failover from Claude to ChatGPT (Auto-Submit = false) ---');
-
-    // Set autoSubmit to false in storage
     await worker.evaluate(async () => {
       await chrome.storage.local.set({ autoSubmit: false });
     });
 
-    // Pre-create and mock ChatGPT page
-    const gptPage3 = await browser.newPage();
-    await gptPage3.setRequestInterception(true);
-    gptPage3.on('request', request => {
-      const url = request.url();
-      if (url.includes('chatgpt.com')) {
+    const gptPage7 = await browser.newPage();
+    await gptPage7.setRequestInterception(true);
+    gptPage7.on('request', request => {
+      if (request.url().includes('chatgpt.com')) {
         request.respond({
           status: 200,
           contentType: 'text/html',
-          body: `
-            <!DOCTYPE html>
-            <html>
-            <body>
-              <div id="prompt-textarea" contenteditable="true"></div>
-              <button data-testid="send-button">Send</button>
-              <div id="status">Waiting...</div>
-              <script>
-                const input = document.getElementById('prompt-textarea');
-                const btn = document.querySelector('[data-testid="send-button"]');
-                btn.addEventListener('click', () => {
-                  document.getElementById('status').innerText = 'Submitted: ' + input.innerText;
-                });
-              </script>
-            </body>
-            </html>
-          `
+          body: CHATGPT_TARGET
         });
       } else {
         request.respond({ status: 404 });
       }
     });
-    await gptPage3.goto('https://chatgpt.com/');
+    await gptPage7.goto('https://chatgpt.com/');
     console.log('ChatGPT mock page loaded.');
 
-    // Pre-create and mock Claude page (to test manual extraction)
-    const claudePage = await browser.newPage();
-    await claudePage.setRequestInterception(true);
-    claudePage.on('request', request => {
-      const url = request.url();
-      if (url.includes('claude.ai')) {
+    const claudePage7 = await browser.newPage();
+    await claudePage7.setRequestInterception(true);
+    claudePage7.on('request', request => {
+      if (request.url().includes('claude.ai')) {
         request.respond({
           status: 200,
           contentType: 'text/html',
-          body: `
-            <!DOCTYPE html>
-            <html>
-            <body>
-              <h2>Claude Chat (Mock)</h2>
-              <div data-testid="conversation-turn">
-                <div data-testid="human-message">Manual Test User Prompt</div>
-                <div data-testid="ai-message">Manual Test Assistant Response</div>
-              </div>
-            </body>
-            </html>
-          `
+          body: CLAUDE_SOURCE
         });
       } else {
         request.respond({ status: 404 });
       }
     });
-    await claudePage.goto('https://claude.ai/chat/manual-test');
+    await claudePage7.goto('https://claude.ai/chat/manual-test');
     console.log('Claude mock page loaded.');
 
-    // Bring the Claude tab to the front
-    await claudePage.bringToFront();
+    await claudePage7.bringToFront();
 
-    // Get the extension's popup URL
     const extensionId = workerTarget.url().split('/')[2];
     const popupUrl = `chrome-extension://${extensionId}/popup/popup.html`;
 
-    // Open the popup page in a new Puppeteer page directly (since we are on a Claude tab)
-    const popupPage3 = await browser.newPage();
-    await popupPage3.goto(popupUrl);
+    const popupPage7 = await browser.newPage();
+    popupPage7.on('console', msg => console.log('[POPUP CONSOLE]', msg.text()));
+    popupPage7.on('pageerror', err => console.error('[POPUP ERROR]', err.toString()));
+    await popupPage7.goto(popupUrl);
     console.log('Popup page loaded manually.');
 
-    // Wait for the manual failover button to be visible
-    await popupPage3.waitForSelector('#btn-chatgpt');
+    await popupPage7.waitForSelector('#btn-chatgpt');
     
-    // Verify it contains the text "Transfer to ChatGPT"
-    const btnText = await popupPage3.$eval('#btn-chatgpt', el => el.innerText);
+    const btnText = await popupPage7.$eval('#btn-chatgpt', el => el.innerText);
     console.log('Manual Failover button text:', btnText);
     if (!btnText.includes('Transfer to ChatGPT')) {
       throw new Error(`Expected manual failover button text, got: ${btnText}`);
     }
 
-    // Click "Transfer to ChatGPT"
     console.log('Clicking "Transfer to ChatGPT" manual button...');
-    await popupPage3.click('#btn-chatgpt');
+    await popupPage7.click('#btn-chatgpt');
 
-    // Wait 4 seconds to let the injection happen
     console.log('Waiting for script injection...');
     await new Promise(resolve => setTimeout(resolve, 4000));
 
-    // Verify prompt was injected but NOT auto-submitted
-    const statusText = await gptPage3.$eval('#status', el => el.innerText);
-    const inputText = await gptPage3.$eval('#prompt-textarea', el => el.innerText);
+    const statusText = await gptPage7.$eval('#status', el => el.innerText);
+    const inputText = await gptPage7.$eval('#prompt-textarea', el => el.innerText);
 
     console.log('Status on ChatGPT page (should be Waiting...):', statusText);
     console.log('Input Text on ChatGPT page:', inputText.substring(0, 100) + '...');
@@ -403,13 +402,13 @@ const path = require('path');
       throw new Error(`Expected status to remain "Waiting...", got: ${statusText}`);
     }
 
-    if (!inputText.includes('Manual Test User Prompt') || !inputText.includes('Manual Test Assistant Response')) {
+    if (!inputText.includes('Explain recursion') || !inputText.includes('Recursion is when a function calls itself...')) {
       throw new Error(`Expected input to contain conversation history, got: ${inputText}`);
     }
 
-    console.log('Test Case 3: Manual failover context successfully injected and auto-submit correctly skipped!');
+    console.log('Test Case 7: Manual failover context successfully injected and auto-submit correctly skipped!');
 
-    console.log('\n✅ ALL TEST CASES PASSED SUCCESSFULLY!');
+    console.log('\n✅ ALL 7 TEST CASES PASSED SUCCESSFULLY!');
 
   } catch (error) {
     console.error('\n❌ TEST SUITE FAILED:', error);

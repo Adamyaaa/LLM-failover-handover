@@ -30,12 +30,12 @@
     },
     {
       "matches": ["https://chatgpt.com/*", "https://chat.openai.com/*"],
-      "js": ["content-scripts/chatgpt-ready.js"],
+      "js": ["content-scripts/chatgpt.js"],
       "run_at": "document_idle"
     },
     {
       "matches": ["https://gemini.google.com/*"],
-      "js": ["content-scripts/gemini-ready.js"],
+      "js": ["content-scripts/gemini.js"],
       "run_at": "document_idle"
     }
   ],
