@@ -1,0 +1,12 @@
+{
+  "name": "llm-failover-tests",
+  "version": "1.0.0",
+  "description": "Integration tests for LLM Failover Chrome Extension",
+  "main": "test.js",
+  "scripts": {
+    "test": "node test.js"
+  },
+  "dependencies": {
+    "puppeteer": "^25.1.0"
+  }
+}
