@@ -222,6 +222,47 @@
       transform: translateX(22px);
     }
 
+    .settings-select {
+      background: rgba(255, 255, 255, 0.06);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      color: var(--text-primary);
+      font-family: var(--font);
+      font-size: 12px;
+      padding: 6px 12px;
+      outline: none;
+      transition: var(--transition);
+      cursor: pointer;
+    }
+
+    .settings-select:focus {
+      border-color: var(--border-focus);
+      background: rgba(255, 255, 255, 0.1);
+    }
+
+    .settings-select option {
+      background-color: #141621;
+      color: var(--text-primary);
+    }
+
+    .settings-input {
+      background: rgba(255, 255, 255, 0.06);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      color: var(--text-primary);
+      font-family: var(--font);
+      font-size: 12px;
+      padding: 8px 12px;
+      outline: none;
+      transition: var(--transition);
+      width: 100%;
+    }
+
+    .settings-input:focus {
+      border-color: var(--border-focus);
+      background: rgba(255, 255, 255, 0.1);
+    }
+
     /* ── Content States ── */
     #main-content {
       display: flex;
@@ -458,6 +499,39 @@
         <input type="checkbox" id="setting-autosubmit" checked />
         <span class="slider"></span>
       </label>
+    </div>
+    
+    <div class="settings-row" style="flex-direction: column; align-items: stretch; gap: 8px; border-top: 1px solid var(--border); padding-top: 8px; margin-top: 4px;">
+      <div class="settings-label" style="display: flex; justify-content: space-between; align-items: center;">
+        <div>
+          <h4>Context Optimization</h4>
+          <p>Optimize history size for long chats</p>
+        </div>
+        <select id="setting-optmode" class="settings-select" style="width: auto; max-width: 180px;">
+          <option value="full">Full History</option>
+          <option value="truncate">Smart Truncation</option>
+          <option value="summarize">AI Summarization</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- AI Settings Container (Hidden by default) -->
+    <div id="ai-settings-container" style="display: none; flex-direction: column; gap: 8px; border-top: 1px solid var(--border); padding-top: 8px; margin-top: 4px;">
+      <div class="settings-row" style="justify-content: space-between;">
+        <div class="settings-label">
+          <h4>AI Provider</h4>
+        </div>
+        <select id="setting-aiprovider" class="settings-select" style="width: auto; max-width: 120px;">
+          <option value="gemini">Gemini</option>
+          <option value="openai">OpenAI</option>
+        </select>
+      </div>
+      <div class="settings-row" style="flex-direction: column; align-items: stretch; gap: 4px;">
+        <div class="settings-label">
+          <h4>API Key</h4>
+        </div>
+        <input type="password" id="setting-apikey" class="settings-input" placeholder="Enter API Key" />
+      </div>
     </div>
   </div>
 

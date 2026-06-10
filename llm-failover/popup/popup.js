@@ -4,6 +4,10 @@ const content = document.getElementById("main-content");
 const settingsToggle = document.getElementById("settings-toggle");
 const settingsPanel = document.getElementById("settings-panel");
 const settingAutoSubmit = document.getElementById("setting-autosubmit");
+const settingOptMode = document.getElementById("setting-optmode");
+const aiSettingsContainer = document.getElementById("ai-settings-container");
+const settingAiProvider = document.getElementById("setting-aiprovider");
+const settingApiKey = document.getElementById("setting-apikey");
 
 // ─── Settings Panel Management ────────────────────────────────────────────────
 
@@ -13,14 +17,45 @@ settingsToggle.addEventListener("click", () => {
 });
 
 // Load settings from storage
-chrome.storage.local.get({ autoSubmit: true }, (data) => {
+chrome.storage.local.get({
+  autoSubmit: true,
+  optMode: "full",
+  aiProvider: "gemini",
+  apiKey: ""
+}, (data) => {
   settingAutoSubmit.checked = data.autoSubmit;
+  settingOptMode.value = data.optMode;
+  settingAiProvider.value = data.aiProvider;
+  settingApiKey.value = data.apiKey;
+  toggleAiContainer(data.optMode);
 });
 
 // Save settings on change
 settingAutoSubmit.addEventListener("change", () => {
   chrome.storage.local.set({ autoSubmit: settingAutoSubmit.checked });
 });
+
+settingOptMode.addEventListener("change", () => {
+  const mode = settingOptMode.value;
+  chrome.storage.local.set({ optMode: mode });
+  toggleAiContainer(mode);
+});
+
+settingAiProvider.addEventListener("change", () => {
+  chrome.storage.local.set({ aiProvider: settingAiProvider.value });
+});
+
+settingApiKey.addEventListener("input", () => {
+  chrome.storage.local.set({ apiKey: settingApiKey.value });
+});
+
+function toggleAiContainer(mode) {
+  if (mode === "summarize") {
+    aiSettingsContainer.style.display = "flex";
+  } else {
+    aiSettingsContainer.style.display = "none";
+  }
+}
 
 // ─── Initialize Popup State ──────────────────────────────────────────────────
 
